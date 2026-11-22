@@ -1,0 +1,24 @@
+diff -ruN a/engine/src/inkling2/metal/ink_metal_backend.mm b/engine/src/inkling2/metal/ink_metal_backend.mm
+--- a/engine/src/inkling2/metal/ink_metal_backend.mm	2026-11-22 12:36:37
++++ b/engine/src/inkling2/metal/ink_metal_backend.mm	2026-11-22 12:47:02
+@@ -183,11 +183,17 @@
+     bool forward_batch(const StepBatch& batch, float* logits_out, TapCapture* taps_out, std::string& err) override {
+         if (batch.n_tokens <= 0) return true;
+         // Auto-slice oversized multi-slot prefill batches (e.g. --bench --parallel 64 --prompt-len 64 -> M=4096)
+-        if (batch.n_tokens > runner_.max_batch) {
++        // kld-fix: the runner computes logits for at most min(M, 64) rows when several rows want logits
++        // (ink_metal_runner.h, n_lg = std::min(M, 64)); rows >= 64 of a sub-batch were returned as zeros.
++        // Slice batches that want more than 64 logit rows into 64-token sub-batches (eval paths only:
++        // --kld-eval / --dump-ref; serve never asks for more than 8 rows).
++        const bool many_logits = (logits_out != nullptr) && batch.count_logits() > 64;
++        if (batch.n_tokens > runner_.max_batch || many_logits) {
+             const int V = mod_.man.c.vocab_unpadded;
++            const int slice = many_logits ? 64 : runner_.max_batch;
+             int out_row = 0;
+-            for (int off = 0; off < batch.n_tokens; off += runner_.max_batch) {
+-                const int take = std::min(runner_.max_batch, batch.n_tokens - off);
++            for (int off = 0; off < batch.n_tokens; off += slice) {
++                const int take = std::min(slice, batch.n_tokens - off);
+                 StepBatch sub;
+                 sub.capture_taps = batch.capture_taps;
+                 sub.img_embeds = batch.img_embeds;

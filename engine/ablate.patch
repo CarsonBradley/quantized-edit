@@ -1,0 +1,535 @@
+diff -ruN a/engine/src/inkling2/ink_backend.h b/engine/src/inkling2/ink_backend.h
+--- a/engine/src/inkling2/ink_backend.h	2026-11-22 12:36:37
++++ b/engine/src/inkling2/ink_backend.h	2026-11-22 12:56:44
+@@ -31,6 +31,9 @@
+     bool enable_dspark = true;
+     std::string dspark_path;     // optional external mtp.safetensors or dspark-*.gguf
+     std::string vision_path;
++    // opt-in runtime directional ablation (Metal only). Empty = off = stock behaviour.
++    std::string ablate_path;     // --ablate DIRS.bin (see metal/ink_ablate_dirs.h for the format)
++    float ablate_scale = 1.0f;   // --ablate-scale S: y' = y - S r (r . y)
+ };
+ 
+ struct BackendStats {
+diff -ruN a/engine/src/inkling2/ink_main.cpp b/engine/src/inkling2/ink_main.cpp
+--- a/engine/src/inkling2/ink_main.cpp	2026-11-22 12:36:37
++++ b/engine/src/inkling2/ink_main.cpp	2026-11-22 12:57:13
+@@ -423,6 +423,10 @@
+             cli_temp = static_cast<float>(std::atof(next().c_str()));
+         } else if (a == "--no-anti-loop") {
+             cfg.anti_loop = false;
++        } else if (a == "--ablate") {
++            cfg.bopts.ablate_path = next();
++        } else if (a == "--ablate-scale") {
++            cfg.bopts.ablate_scale = static_cast<float>(std::atof(next().c_str()));
+         } else if (a == "--help" || a == "-h") {
+             printf("strata-inkling %s - Unified Inkling-2-Mini (.strata v1.1 / HF safetensors / .gguf) Shape Engine\n"
+                    "  --version\n"
+@@ -431,11 +435,24 @@
+                    "  --selfcheck [--native PATH] [--verify-hash] [--cpu] [--gpus 1|2] [--kv fp16|fp8|k8v8|k8v4]\n"
+                    "  --bench --native PATH [--parallel 1..64] [--gpus 1|2] [--ep-split F] [--vram-reserve-mib N] [--cpu-threads N] [--kv auto|fp16|fp8|k8v8|k8v4] [--prompt-len N] [--gen N]\n"
+                    "  --kld-eval REF.bin --native PATH\n"
+-                   "  --serve --native PATH [--vision VISION] [--dspark PATH] [--max-context N] [--parallel 1..64] [--gpus 1|2] [--draft auto|dspark|off]\n",
++                   "  --serve --native PATH [--vision VISION] [--dspark PATH] [--max-context N] [--parallel 1..64] [--gpus 1|2] [--draft auto|dspark|off]\n"
++                   "  [local patch] --ablate DIRS.bin [--ablate-scale S]  (Metal; any mode above): y' = y - S r (r.y) on every residual writer\n",
+                    INKLING_VERSION);
+             return 0;
+         } else {
+             fprintf(stderr, "unknown option: %s\n", a.c_str());
++            return 2;
++        }
++    }
++
++    // --ablate is implemented in the Metal backend only.
++    if (!cfg.bopts.ablate_path.empty()) {
++#ifndef INKLING_ENABLE_METAL
++        fprintf(stderr, "error: --ablate needs the Metal backend\n");
++        return 2;
++#endif
++        if (cfg.force_cpu) {
++            fprintf(stderr, "error: --ablate is not supported with --cpu\n");
+             return 2;
+         }
+     }
+diff -ruN a/engine/src/inkling2/metal/CMakeLists.txt b/engine/src/inkling2/metal/CMakeLists.txt
+--- a/engine/src/inkling2/metal/CMakeLists.txt	2026-11-22 12:36:37
++++ b/engine/src/inkling2/metal/CMakeLists.txt	2026-11-22 12:55:43
+@@ -21,6 +21,7 @@
+     "${CMAKE_CURRENT_SOURCE_DIR}/ink_metal_dspark.metal"
+     "${CMAKE_CURRENT_SOURCE_DIR}/ink_metal_vision.metal"
+     "${CMAKE_CURRENT_SOURCE_DIR}/ink_metal_mpp.metal"
++    "${CMAKE_CURRENT_SOURCE_DIR}/ink_metal_ablate.metal"
+   COMMENT "Embedding Inkling-2-Mini Metal shaders"
+ )
+ 
+diff -ruN a/engine/src/inkling2/metal/embed_shaders.py b/engine/src/inkling2/metal/embed_shaders.py
+--- a/engine/src/inkling2/metal/embed_shaders.py	2026-11-22 12:36:37
++++ b/engine/src/inkling2/metal/embed_shaders.py	2026-11-22 12:55:43
+@@ -21,6 +21,7 @@
+         ("kInkMetalDsparkSrc", "ink_metal_dspark.metal"),
+         ("kInkMetalVisionSrc", "ink_metal_vision.metal"),
+         ("kInkMetalMppSrc", "ink_metal_mpp.metal"),
++        ("kInkMetalAblateSrc", "ink_metal_ablate.metal"),  # opt-in --ablate library
+     ]
+     for var, fn in pairs:
+         txt = (base / fn).read_text(encoding="utf-8")
+diff -ruN a/engine/src/inkling2/metal/ink_ablate_dirs.h b/engine/src/inkling2/metal/ink_ablate_dirs.h
+--- a/engine/src/inkling2/metal/ink_ablate_dirs.h	1969-12-31 19:00:00
++++ b/engine/src/inkling2/metal/ink_ablate_dirs.h	2026-11-22 12:56:57
+@@ -0,0 +1,77 @@
++// ink_ablate_dirs.h - local patch (quantized-edit): strict loader for the --ablate direction file (DIRS.bin).
++//
++// DIRS.bin layout (little-endian), written by engine/make_dirs.py in the quantized-edit repository:
++//   off  0  char[8]   magic  "INKABL\0\1"
++//   off  8  u32       version          = 1
++//   off 12  u32       n_layers         = model physical layers (24)
++//   off 16  u32       hidden           = model hidden size (2304)
++//   off 20  u32       n_vec            = n_layers + 1
++//   off 24  u32       flags            = 1  (bit 0: row n_layers is the token-embedding direction)
++//   off 28  u32       header_bytes     = 64
++//   off 32  u8[32]    sha256 of the source LoRA GGUF (provenance only)
++//   off 64  f32[n_vec][hidden]  unit vectors: rows 0..n_layers-1 = r_L (attn wo_ud + routed experts' down),
++//                               row n_layers = r_emb
++// File size must be exactly 64 + n_vec * hidden * 4.
++#pragma once
++
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <vector>
++
++namespace ink_metal {
++
++struct AblateDirs {
++    std::vector<float> dirs;   // [n_layers + 1, hidden]
++    uint8_t src_sha256[32]{};
++};
++
++inline bool load_ablate_dirs(const std::string& path, int n_layers, int hidden, AblateDirs& out, std::string& err) {
++    static const uint8_t kMagic[8] = {'I', 'N', 'K', 'A', 'B', 'L', 0x00, 0x01};
++    FILE* f = std::fopen(path.c_str(), "rb");
++    if (!f) { err = "ablate: cannot open " + path; return false; }
++    std::vector<uint8_t> buf;
++    uint8_t tmp[1 << 16];
++    size_t n;
++    while ((n = std::fread(tmp, 1, sizeof(tmp), f)) > 0) {
++        buf.insert(buf.end(), tmp, tmp + n);
++        if (buf.size() > (64u << 20)) { std::fclose(f); err = "ablate: file too large"; return false; }
++    }
++    std::fclose(f);
++    if (buf.size() < 64) { err = "ablate: file shorter than its 64-byte header"; return false; }
++    if (std::memcmp(buf.data(), kMagic, 8) != 0) { err = "ablate: bad magic (expected INKABL\\0\\1)"; return false; }
++    uint32_t h[6];
++    std::memcpy(h, buf.data() + 8, sizeof(h));
++    const uint32_t version = h[0], nl = h[1], hd = h[2], nv = h[3], flags = h[4], hbytes = h[5];
++    if (version != 1) { err = "ablate: unsupported version " + std::to_string(version); return false; }
++    if (hbytes != 64) { err = "ablate: header_bytes != 64"; return false; }
++    if ((int)nl != n_layers) { err = "ablate: n_layers " + std::to_string(nl) + " != model " + std::to_string(n_layers); return false; }
++    if ((int)hd != hidden) { err = "ablate: hidden " + std::to_string(hd) + " != model " + std::to_string(hidden); return false; }
++    if (nv != nl + 1) { err = "ablate: n_vec must be n_layers + 1"; return false; }
++    if (flags != 1u) { err = "ablate: flags must be 1 (embedding row present)"; return false; }
++    const size_t want = 64 + (size_t)nv * hd * sizeof(float);
++    if (buf.size() != want) {
++        err = "ablate: file size " + std::to_string(buf.size()) + " != expected " + std::to_string(want);
++        return false;
++    }
++    std::memcpy(out.src_sha256, buf.data() + 32, 32);
++    out.dirs.resize((size_t)nv * hd);
++    std::memcpy(out.dirs.data(), buf.data() + 64, out.dirs.size() * sizeof(float));
++    for (uint32_t v = 0; v < nv; ++v) {
++        double ss = 0.0;
++        for (uint32_t i = 0; i < hd; ++i) {
++            const float x = out.dirs[(size_t)v * hd + i];
++            if (!std::isfinite(x)) { err = "ablate: non-finite value in row " + std::to_string(v); return false; }
++            ss += (double)x * x;
++        }
++        if (std::fabs(std::sqrt(ss) - 1.0) > 1e-4) {
++            err = "ablate: row " + std::to_string(v) + " is not a unit vector (norm " + std::to_string(std::sqrt(ss)) + ")";
++            return false;
++        }
++    }
++    return true;
++}
++
++}  // namespace ink_metal
+diff -ruN a/engine/src/inkling2/metal/ink_metal_ablate.metal b/engine/src/inkling2/metal/ink_metal_ablate.metal
+--- a/engine/src/inkling2/metal/ink_metal_ablate.metal	1969-12-31 19:00:00
++++ b/engine/src/inkling2/metal/ink_metal_ablate.metal	2026-11-22 12:55:36
+@@ -0,0 +1,162 @@
++// ink_metal_ablate.metal - OPT-IN runtime directional ablation (--ablate DIRS.bin) for Inkling-2-Mini.
++// Local patch (W3), not part of upstream Strata. Compiled into its own MTLLibrary ONLY when --ablate is
++// given, so the stock libraries (codecs/ops/dspark/vision/mpp) and their dispatch graph are untouched
++// when the flag is absent.
++//
++// The AtomicChat uncensoring LoRA is, for every residual writer W (attn wo_ud, all routed experts'
++// down projections, the token embedding), exactly W' = (I - r r^T) W with one unit vector r per layer
++// (r_emb for the embedding). Applying it to the writer's OUTPUT is therefore exact:
++//     y' = y - S * r (r . y)        (S = --ablate-scale, 1.0 = the published edit)
++// and for the MoE it commutes with the routing-weighted sum over experts.
++// All buffers touched here are FP32 activations.
++#include <metal_stdlib>
++using namespace metal;
++
++#define ABL_D 2304
++#define ABL_RMS_EPS 1e-6f
++
++static inline float abl_bf16_to_f32(ushort b) { return as_type<float>(uint(b) << 16); }
++
++// Same reduction as ops_tg_sum in ink_metal_ops.metal (simd_sum + 8-slot threadgroup sum).
++static inline float abl_tg_sum(float v, threadgroup float* sh, uint tid, uint nthr) {
++    v = simd_sum(v);
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if ((tid & 31u) == 0u) sh[tid >> 5] = v;
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    float r = 0.0f;
++    const uint nw = (nthr + 31u) >> 5;
++    for (uint i = 0; i < nw; ++i) r += sh[i];
++    return r;
++}
++
++// In-place projection of M rows of [M, 2304] FP32: y[m] -= S * r (r . y[m]).
++// grid (M, 1, 1), 256 threads. Sites A (b_wo_raw), M1/M2 (b_moe_raw).
++kernel void ink_abl_proj(
++    device float* y               [[buffer(0)]],
++    device const float* r         [[buffer(1)]],
++    constant float& S             [[buffer(2)]],
++    uint m   [[threadgroup_position_in_grid]],
++    uint tid [[thread_index_in_threadgroup]]) {
++    threadgroup float sh[8];
++    device float* row = y + (size_t)m * ABL_D;
++    float v[9];
++    float s = 0.0f;
++    for (uint j = 0; j < 9; ++j) {
++        v[j] = row[tid + 256u * j];
++        s += v[j] * r[tid + 256u * j];
++    }
++    const float c = abl_tg_sum(s, sh, tid, 256) * S;
++    for (uint j = 0; j < 9; ++j) row[tid + 256u * j] = v[j] - c * r[tid + 256u * j];
++}
++
++// Site M3: replaces the reduce half of the fused ink_moe_red8_sconv_add on the decode/multi-slot path.
++// out[m] = proj( sum_{k<8} y_pairs[m*8+k] )  (same k-order summation as ink_moe_reduce8 / red8_sconv_add)
++// grid (M, 1, 1), 256 threads. The sconv + residual add then runs in stock ink_sconv4_attn_res.
++kernel void ink_abl_red8_proj(
++    device const float* y_pairs   [[buffer(0)]],
++    device const float* r         [[buffer(1)]],
++    device float* out             [[buffer(2)]],
++    constant float& S             [[buffer(3)]],
++    uint m   [[threadgroup_position_in_grid]],
++    uint tid [[thread_index_in_threadgroup]]) {
++    threadgroup float sh[8];
++    float v[9];
++    float s = 0.0f;
++    for (uint j = 0; j < 9; ++j) {
++        const uint d = tid + 256u * j;
++        float a = 0.0f;
++        for (int k = 0; k < 8; ++k) a += y_pairs[((size_t)m * 8 + k) * ABL_D + d];
++        v[j] = a;
++        s += a * r[d];
++    }
++    const float c = abl_tg_sum(s, sh, tid, 256) * S;
++    for (uint j = 0; j < 9; ++j) {
++        const uint d = tid + 256u * j;
++        out[(size_t)m * ABL_D + d] = v[j] - c * r[d];
++    }
++}
++
++// Site E: embedding lookup + projection (BEFORE embed_norm, as llama.cpp adds the token_embd LoRA delta
++// to get_rows() output) + embed_norm RMSNorm. Image rows bypass exactly like stock (llama.cpp applies the
++// token_embd LoRA only to token rows). Exact two-pass: RMS is taken over the projected row.
++// Argument layout = stock ink_embed_q8row (buffers 0..6) + r_emb (7) + S (8).
++kernel void ink_abl_embed_q8row(
++    device const uchar* embed_w   [[buffer(0)]],
++    device const float* norm_w    [[buffer(1)]],
++    device const int* tok_ids     [[buffer(2)]],
++    device const uchar* is_img    [[buffer(3)]],
++    device const float* img_emb   [[buffer(4)]],
++    device float* cur_out         [[buffer(5)]],
++    constant int& V_padded        [[buffer(6)]],
++    device const float* r         [[buffer(7)]],
++    constant float& S             [[buffer(8)]],
++    uint m   [[threadgroup_position_in_grid]],
++    uint tid [[thread_index_in_threadgroup]]) {
++    threadgroup float sh[8];
++    if (is_img && is_img[m] != 0) {
++        for (uint d = tid; d < ABL_D; d += 256)
++            cur_out[(size_t)m * ABL_D + d] = img_emb[(size_t)m * ABL_D + d];
++        return;
++    }
++    const int id = tok_ids[m];
++    const float sc = ((device const float*)embed_w)[id];
++    device const char* row = (device const char*)(embed_w + (size_t)V_padded * 4) + (size_t)id * ABL_D;
++    float v[9];
++    float s = 0.0f;
++    for (uint j = 0; j < 9; ++j) {
++        const uint d = tid + 256u * j;
++        v[j] = float(row[d]) * sc;
++        s += v[j] * r[d];
++    }
++    const float c = abl_tg_sum(s, sh, tid, 256) * S;
++    float ss = 0.0f;
++    for (uint j = 0; j < 9; ++j) {
++        v[j] = v[j] - c * r[tid + 256u * j];
++        ss += v[j] * v[j];
++    }
++    const float inv = rsqrt(abl_tg_sum(ss, sh, tid, 256) / float(ABL_D) + ABL_RMS_EPS);
++    for (uint j = 0; j < 9; ++j) {
++        const uint d = tid + 256u * j;
++        cur_out[(size_t)m * ABL_D + d] = v[j] * inv * norm_w[d];
++    }
++}
++
++// Argument layout = stock ink_embed_bf16 (buffers 0..5) + r_emb (6) + S (7).
++kernel void ink_abl_embed_bf16(
++    device const ushort* embed_w  [[buffer(0)]],
++    device const float* norm_w    [[buffer(1)]],
++    device const int* tok_ids     [[buffer(2)]],
++    device const uchar* is_img    [[buffer(3)]],
++    device const float* img_emb   [[buffer(4)]],
++    device float* cur_out         [[buffer(5)]],
++    device const float* r         [[buffer(6)]],
++    constant float& S             [[buffer(7)]],
++    uint m   [[threadgroup_position_in_grid]],
++    uint tid [[thread_index_in_threadgroup]]) {
++    threadgroup float sh[8];
++    if (is_img && is_img[m] != 0) {
++        for (uint d = tid; d < ABL_D; d += 256)
++            cur_out[(size_t)m * ABL_D + d] = img_emb[(size_t)m * ABL_D + d];
++        return;
++    }
++    const int id = tok_ids[m];
++    device const ushort* row = embed_w + (size_t)id * ABL_D;
++    float v[9];
++    float s = 0.0f;
++    for (uint j = 0; j < 9; ++j) {
++        const uint d = tid + 256u * j;
++        v[j] = abl_bf16_to_f32(row[d]);
++        s += v[j] * r[d];
++    }
++    const float c = abl_tg_sum(s, sh, tid, 256) * S;
++    float ss = 0.0f;
++    for (uint j = 0; j < 9; ++j) {
++        v[j] = v[j] - c * r[tid + 256u * j];
++        ss += v[j] * v[j];
++    }
++    const float inv = rsqrt(abl_tg_sum(ss, sh, tid, 256) / float(ABL_D) + ABL_RMS_EPS);
++    for (uint j = 0; j < 9; ++j) {
++        const uint d = tid + 256u * j;
++        cur_out[(size_t)m * ABL_D + d] = v[j] * inv * norm_w[d];
++    }
++}
+diff -ruN a/engine/src/inkling2/metal/ink_metal_backend.mm b/engine/src/inkling2/metal/ink_metal_backend.mm
+--- a/engine/src/inkling2/metal/ink_metal_backend.mm	2026-11-22 12:47:02
++++ b/engine/src/inkling2/metal/ink_metal_backend.mm	2026-11-22 13:04:42
+@@ -6,12 +6,14 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <memory>
+ #include <string>
+ #include <vector>
+ 
+ #include "ink_metal_runner.h"
++#include "ink_ablate_dirs.h"
+ 
+ #ifdef INK_METAL_EMBEDDED_SHADERS
+ #include "ink_metal_embedded_shaders.h"
+@@ -86,6 +88,23 @@
+ 
+     bool init(const InkModelFile& model, const BackendOpts& opts, std::string& err) override {
+         kv_dtype_ = opts.kv_dtype;
++        // opt-in runtime directional ablation. With --ablate absent nothing here runs (no file read, no extra
++        // library, no extra dispatch). The direction file is validated BEFORE the model is mapped, so a bad file
++        // fails without touching GPU memory.
++        ink_metal::AblateDirs ad;
++        const bool want_abl = !opts.ablate_path.empty();
++        if (want_abl) {
++#ifdef INK_METAL_EMBEDDED_SHADERS
++            if (!std::isfinite(opts.ablate_scale) || std::fabs(opts.ablate_scale) > 8.0f) {
++                err = "ablate: --ablate-scale must be finite and in [-8, 8]";
++                return false;
++            }
++            if (!ink_metal::load_ablate_dirs(opts.ablate_path, model.m.c.n_phys, model.m.c.hidden, ad, err)) return false;
++#else
++            err = "ablate: requires the embedded-shader build";
++            return false;
++#endif
++        }
+         if (!mod_.load(cx_, model.path, err)) return false;
+         const int par = std::max(1, std::min(64, opts.parallel));
+         const int batch_cap = std::max(256, std::max(opts.chunk, par));
+@@ -93,6 +112,19 @@
+                           opts.enable_dspark, opts.vision_path, "", err)) {
+             return false;
+         }
++#ifdef INK_METAL_EMBEDDED_SHADERS
++        if (want_abl) {
++            if (mod_.man.c.n_phys != model.m.c.n_phys || mod_.man.c.hidden != model.m.c.hidden) {
++                err = "ablate: manifest mismatch between loaders";
++                return false;
++            }
++            if (!runner_.enable_ablation(ad.dirs, opts.ablate_scale, ink_metal::kInkMetalAblateSrc, err)) return false;
++            char sha[17];
++            for (int i = 0; i < 8; ++i) snprintf(sha + 2 * i, 3, "%02x", ad.src_sha256[i]);
++            fprintf(stderr, "[ink_metal] ablate ON: %s (lora sha256 %s...) layers=%d scale=%.4f sites=embed+attn_wo_ud+moe_down\n",
++                    opts.ablate_path.c_str(), sha, mod_.man.c.n_phys, opts.ablate_scale);
++        }
++#endif
+         snaps_.resize((size_t)par);
+         frnn_snaps_.resize((size_t)par);
+         slot_used_.assign((size_t)par, 0);
+@@ -187,10 +219,19 @@
+         // (ink_metal_runner.h, n_lg = std::min(M, 64)); rows >= 64 of a sub-batch were returned as zeros.
+         // Slice batches that want more than 64 logit rows into 64-token sub-batches (eval paths only:
+         // --kld-eval / --dump-ref; serve never asks for more than 8 rows).
+-        const bool many_logits = (logits_out != nullptr) && batch.count_logits() > 64;
++        // (ablate build, eval-only): STRATA_INK_EVAL_LOGIT_SLICE=N (1..64) slices every multi-logit batch into
++        // N-token forwards, so --dump-ref can produce the SAME positions' logits through the decode (N=1), verify-ring
++        // (N=2..8), mixed (N=10..31) and prefill (N=32..64) code paths. Unset = 64. Use it only with --dump-ref/--kld-eval.
++        static const int eval_slice = [] {
++            const char* e = std::getenv("STRATA_INK_EVAL_LOGIT_SLICE");
++            const int v = (e && *e) ? std::atoi(e) : 0;
++            return (v >= 1 && v <= 64) ? v : 0;
++        }();
++        const int n_lg_want = (logits_out != nullptr) ? batch.count_logits() : 0;
++        const bool many_logits = n_lg_want > 64 || (eval_slice > 0 && n_lg_want > eval_slice);
+         if (batch.n_tokens > runner_.max_batch || many_logits) {
+             const int V = mod_.man.c.vocab_unpadded;
+-            const int slice = many_logits ? 64 : runner_.max_batch;
++            const int slice = many_logits ? (eval_slice > 0 ? eval_slice : 64) : runner_.max_batch;
+             int out_row = 0;
+             for (int off = 0; off < batch.n_tokens; off += slice) {
+                 const int take = std::min(slice, batch.n_tokens - off);
+diff -ruN a/engine/src/inkling2/metal/ink_metal_runner.h b/engine/src/inkling2/metal/ink_metal_runner.h
+--- a/engine/src/inkling2/metal/ink_metal_runner.h	2026-11-22 12:36:37
++++ b/engine/src/inkling2/metal/ink_metal_runner.h	2026-11-22 12:56:29
+@@ -226,6 +226,42 @@
+ 
+     double last_gpu_ms = 0.0;
+ 
++    // ---- opt-in runtime directional ablation (--ablate DIRS.bin). Off unless enable_ablation() ran. ----
++    // b_abl_dirs: [n_phys + 1, D] FP32 unit vectors: rows 0..n_phys-1 = per-physical-layer r_L (attention wo_ud
++    // AND routed-expert down writers share it), row n_phys = r_emb (token embedding writer).
++    bool use_abl = false;
++    float abl_scale = 1.0f;
++    int lib_abl = -1;
++    mtl::Buffer b_abl_dirs;
++    mtl::Pipeline p_abl_proj, p_abl_red8_proj, p_abl_emb_q8, p_abl_emb_bf16;
++
++    bool enable_ablation(const std::vector<float>& dirs, float scale, const char* msl_src, std::string& err) {
++        const auto& c = mod->man.c;
++        if (c.hidden != 2304) { err = "ablate: kernels are specialised for hidden=2304"; return false; }
++        if (dirs.size() != (size_t)(c.n_phys + 1) * (size_t)c.hidden) { err = "ablate: direction table size mismatch"; return false; }
++        std::string why;
++        lib_abl = cx->compile_try({}, msl_src, false, &why);
++        if (lib_abl < 0) { err = "ablate MSL: " + why; return false; }
++        p_abl_proj      = cx->pipeline(lib_abl, "ink_abl_proj");
++        p_abl_red8_proj = cx->pipeline(lib_abl, "ink_abl_red8_proj");
++        p_abl_emb_q8    = cx->pipeline(lib_abl, "ink_abl_embed_q8row");
++        p_abl_emb_bf16  = cx->pipeline(lib_abl, "ink_abl_embed_bf16");
++        b_abl_dirs = cx->alloc(dirs.size() * sizeof(float));
++        std::memcpy(b_abl_dirs.ptr, dirs.data(), dirs.size() * sizeof(float));
++        abl_scale = scale;
++        use_abl = true;
++        return true;
++    }
++
++    // y[0..M) -= S * r_L (r_L . y), in place, FP32 [M, D]; barrier before (reads the writer's fresh output).
++    void push_abl_proj(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& y, int ip, int M) {
++        mtl::Dispatch d;
++        d.p = &p_abl_proj; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
++        d.args = {mtl::Arg::B(y), mtl::Arg::B(b_abl_dirs, (size_t)ip * mod->man.c.hidden * sizeof(float)),
++                  mtl::Arg::V(abl_scale)};
++        ds.push_back(std::move(d));
++    }
++
+     bool init(mtl::Context& ctx, InkMetalModel& m, int slots, int ctx_len, int batch_cap,
+               bool enable_dspark, const std::string& vision_path,
+               const std::string& kernel_dir, std::string& err) {
+@@ -1026,6 +1062,12 @@
+                           mtl::Arg::B(b_tok_ids), mtl::Arg::B(b_is_img), mtl::Arg::B(b_img_emb), mtl::Arg::B(b_cur),
+                           mtl::Arg::V(c.vocab_padded)};
+             }
++            // ablate site E: same dispatch, ablating twin kernel (projection before embed_norm, image rows bypass).
++            if (use_abl) {
++                d.p = (eti.fmt == FMT_BF16) ? &p_abl_emb_bf16 : &p_abl_emb_q8;
++                d.args.push_back(mtl::Arg::B(b_abl_dirs, (size_t)c.n_phys * D * sizeof(float)));
++                d.args.push_back(mtl::Arg::V(abl_scale));
++            }
+             ds.push_back(std::move(d));
+         }
+ 
+@@ -1472,6 +1514,10 @@
+             } else {
+                 push_trunk_linear(ds, p + ".attn.wo_ud.weight", mtl::Arg::B(b_attn_out), mtl::Arg::B(b_wo_raw), M);
+             }
++            // ablate site A: project the attention writer's output (FP32 b_wo_raw) BEFORE attn_sconv, so all three
++            // sconv/residual variants below (tree, single-slot prefill, fused multi/decode) and the sconv history/rings
++            // see the projected value.
++            if (use_abl) push_abl_proj(ds, b_wo_raw, ip, M);
+             const bool is_blk = (ip % c.block_size == 0);
+             if (is_tree) {
+                 int s0 = as_p[0], sb_i = is_blk ? 1 : 0;
+@@ -1689,6 +1735,8 @@
+                                mtl::Arg::B(b_topk_w), mtl::Arg::B(b_moe_raw)};
+                     ds.push_back(std::move(dc));
+                 }
++                // ablate site M1 (Metal 4 MPP MoE path, M >= 10): project the routing-weighted expert sum.
++                if (use_abl) push_abl_proj(ds, b_moe_raw, ip, M);
+                 if (is_tree) {
+                     int s0 = as_p[0];
+                     mtl::Dispatch d;
+@@ -1801,6 +1849,8 @@
+                         d.args = {mtl::Arg::B(b_moe_yp), mtl::Arg::B(b_moe_raw)};
+                         ds.push_back(std::move(d));
+                     }
++                    // ablate site M2 (non-MPP tree verify): project after reduce8, before the tree sconv.
++                    if (use_abl) push_abl_proj(ds, b_moe_raw, ip, M);
+                     int s0 = as_p[0];
+                     mtl::Dispatch d;
+                     d.p = &p_sconv4_mlp_add_tree;
+@@ -1816,11 +1866,40 @@
+                         d.args = {mtl::Arg::B(b_moe_yp), mtl::Arg::B(b_moe_raw)};
+                         ds.push_back(std::move(d));
+                     }
++                    // ablate site M2 (non-MPP single-slot prefill M >= 16): project after reduce8, before sconv.
++                    if (use_abl) push_abl_proj(ds, b_moe_raw, ip, M);
+                     push_sconv(b_moe_raw, sc_lbase + InkMetalModel::kSconvMlpOff, b_kd_taps, sc_hist_mlp[visit], sc_ring_mlp[visit], b_moe_out, D, 0, true);
+                     {
+                         mtl::Dispatch d;
+                         d.p = &p_add; d.grid[0] = (uint32_t)((M_stride + 255) / 256); d.tg[0] = 256;
+                         d.args = {mtl::Arg::B(b_cur), mtl::Arg::B(b_moe_out), mtl::Arg::B(b_cur), mtl::Arg::V(M_stride)};
++                        ds.push_back(std::move(d));
++                    }
++                } else if (use_abl) {
++                    // ablate site M3 (decode / multi-slot / DSpark linear verify, M < 10): the stock fused
++                    // ink_moe_red8_sconv_add cannot project (channels are split over 9 threadgroups), so split it:
++                    // (1) reduce8 + projection -> b_moe_raw, (2) stock ink_sconv4_attn_res pointed at the MLP sconv
++                    // weights/history/ring with save_block = 0, which is the same arithmetic as the fused kernel's
++                    // sconv + residual add (incl. the verify-ring save) and stores the PROJECTED value in the history.
++                    {
++                        mtl::Dispatch d;
++                        d.p = &p_abl_red8_proj; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
++                        d.args = {mtl::Arg::B(b_moe_yp), mtl::Arg::B(b_abl_dirs, (size_t)ip * D * sizeof(float)),
++                                  mtl::Arg::B(b_moe_raw), mtl::Arg::V(abl_scale)};
++                        ds.push_back(std::move(d));
++                    }
++                    {
++                        const int save_block = 0;
++                        mtl::Dispatch d;
++                        d.p = &p_sconv4_attn_res;
++                        d.grid[0] = (uint32_t)n_active_slots; d.grid[1] = (uint32_t)((D + 255) / 256); d.tg[0] = 256;
++                        d.args = {mtl::Arg::B(b_moe_raw), mtl::Arg::B(mod->static_sconv_buf, (sc_lbase + InkMetalModel::kSconvMlpOff) * 4),
++                                  mtl::Arg::B(sc_hist_mlp[visit]),
++                                  mtl::Arg::B(b_active_slots), mtl::Arg::B(b_slot_tok_off), mtl::Arg::B(b_slot_tok_cnt), mtl::Arg::B(b_slot_tok_idx),
++                                  mtl::Arg::B(b_cur),
++                                  mtl::Arg::B(b_moe_out),  // block_dst: unused with save_block = 0
++                                  mtl::Arg::B(sc_ring_mlp[visit]),
++                                  mtl::Arg::V(save_block), mtl::Arg::V(save_ring)};
+                         ds.push_back(std::move(d));
+                     }
+                 } else {

@@ -1,0 +1,118 @@
+#!/bin/bash
+# On-demand OpenAI-compatible server for Inkling-2-Mini on Strata's Metal engine (strata-inkling --serve).
+#
+#   inkling-s start      start the HTTP shim on 127.0.0.1:8097 (the model loads on the first request)
+#   inkling-s stop       stop the shim and its engine (no engine process is left behind)
+#   inkling-s status     running? model loaded? engine memory
+#   inkling-s ask "..."  one-shot prompt (starts the shim first if needed)
+#   inkling-s unload     drop the model now (the shim keeps running; next request reloads it)
+#   inkling-s logs       follow the shim log (engine stderr is in run/engine.log)
+#   inkling-s test       run the CPU-only test suite (fake engine; no GPU)
+#   inkling-s setup      fetch the pinned Python packages into uv's cache (the only step that uses the network)
+#
+# Nothing loads until a request arrives. Before loading, the shim checks memory pressure and free memory (plus the
+# optional checks in README.md) and answers 503 if one fails. While loaded, a watchdog unloads the engine on memory
+# trouble. It unloads after INKLING_S_IDLE seconds idle.
+#
+# Required: INKLING_S_MODEL_DIR (folder with tokenizer.json and chat_template.jinja; the pack's Hugging Face folder).
+# Env overrides: INKLING_S_PORT (8097), INKLING_S_ENGINE (strata-inkling binary, default on PATH),
+# INKLING_S_ENGINE_ARGS (extra engine arguments, e.g. "--ablate /path/DIRS.bin"), INKLING_S_PACK (the .strata file,
+# default $INKLING_S_MODEL_DIR/Inkling-2-Mini-SQ-15.strata), INKLING_S_CTX (65536),
+# INKLING_S_IDLE (300 seconds; <= 0 = never), INKLING_S_DRAFT (off | auto), INKLING_S_EFFORT (unset = the
+# template's 0.9; none..max), INKLING_S_REUSE (splice | off), INKLING_S_LITERALS (text | special),
+# INKLING_S_ANTI_LOOP (1 | 0), INKLING_S_NEED_GB (memory the engine needs; default from ctx),
+# INKLING_S_DEBUG (1 = log raw replies), and the optional guard settings INKLING_S_GUARD_LOCK, INKLING_S_HEALTH_URL,
+# INKLING_S_PAUSE_FILE, INKLING_S_WATCH_FILE, INKLING_S_WATCH_PATTERN (README.md). Always binds 127.0.0.1.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+PORT="${INKLING_S_PORT:-8097}"
+URL="http://127.0.0.1:$PORT"
+RUN="$HERE/run"; PIDF="$RUN/shim.pid"; EPIDF="$RUN/engine.pid"; LOG="$RUN/shim.log"
+DEPS=(--with jinja2==3.1.6 --with tokenizers==0.23.3)
+TEST_DEPS=(--with transformers==5.18.0 --with pytest==9.2.0)
+UV=(uv run --offline --no-project --python 3.12)
+mkdir -p "$RUN"
+
+pid() { [[ -f $PIDF ]] && kill -0 "$(cat "$PIDF")" 2>/dev/null && cat "$PIDF"; }
+epid() { [[ -f $EPIDF ]] && kill -0 "$(cat "$EPIDF")" 2>/dev/null && ps -p "$(cat "$EPIDF")" -o command= | grep -q -- '--serve' && cat "$EPIDF"; }
+healthy() { curl -sf -m 2 "$URL/health" >/dev/null; }
+
+start() {
+  if p=$(pid); then echo "already running (pid $p) at $URL"; return; fi
+  echo "starting inkling-s on $URL (model loads on first request); log: $LOG"
+  (cd "$HERE" && INKLING_S_PORT="$PORT" nohup "${UV[@]}" "${DEPS[@]}" python -m inkling_shim.server >"$LOG" 2>&1 &)
+  for _ in $(seq 1 60); do
+    healthy && { echo "ready (pid $(cat "$PIDF"))"; return; }
+    sleep 0.5
+  done
+  echo "not healthy after 30s; last log lines:" >&2; tail -20 "$LOG" >&2
+  [[ -f $LOG ]] && grep -q "Failed to download\|offline" "$LOG" && echo "(run \`inkling-s setup\` once)" >&2
+  exit 1
+}
+
+stop() {
+  local e; e=$(epid || true)
+  if p=$(pid); then
+    kill "$p"                                   # the shim cancels its request, sends QUIT, waits for the engine
+    for _ in $(seq 1 80); do kill -0 "$p" 2>/dev/null || break; sleep 0.5; done
+    kill -0 "$p" 2>/dev/null && kill -9 "$p"
+    echo "stopped (pid $p)"
+  else echo "not running"; fi
+  if [[ -n ${e:-} ]] && kill -0 "$e" 2>/dev/null; then  # belt and braces: never leave the engine behind
+    kill "$e"; sleep 2; kill -0 "$e" 2>/dev/null && kill -9 "$e"
+    echo "stopped leftover engine (pid $e)"
+  fi
+  rm -f "$PIDF" "$EPIDF"
+}
+
+status() {
+  if p=$(pid); then
+    curl -s -m 3 "$URL/health" | python3 -c 'import json,sys
+try:
+    h = json.load(sys.stdin)
+    h.update(h.pop("stats"))
+    print("engine {engine}, ctx {ctx}, busy {busy}, queued {queued}, idle {idle_s}s, loads {loads}, requests "
+          "{requests}, prompt tokens {prompt_tokens} (reused {reused_tokens}, re-read {reread_tokens}), "
+          "generated {generated_tokens}".format(**h))
+    print("  binary: " + " ".join(h["engine_cmd"]))
+    print("  pack:   " + h["pack"])
+    print("  args:   " + (" ".join(h["engine_args"]) or "(none)") + "; draft " + h["draft"]
+          + "; anti-loop " + str(h["anti_loop"]) + "; reuse " + str(h["reuse"]))
+    print("  memory guard: " + ("on, " + h["guard"] if h["memory_guard"] else "OFF"))
+    if h.get("last_watchdog_unload"):
+        print("  last watchdog unload: {reason} ({seconds_ago}s ago)".format(**h["last_watchdog_unload"]))
+except Exception: print("health check failed")' | sed "1s|^|running: pid $p, $URL, |"
+    if e=$(epid); then echo "engine: pid $e, mem $(top -l 1 -pid "$e" -stats mem 2>/dev/null | tail -1)"; fi
+  else echo "not running"; fi
+}
+
+ask() {
+  [[ $# -gt 0 ]] || { echo 'usage: inkling-s ask "prompt"' >&2; exit 1; }
+  pid >/dev/null || start >&2
+  python3 - "$URL" "$*" <<'PY'
+import json, sys, urllib.request
+url, prompt = sys.argv[1], sys.argv[2]
+body = {"model": "inkling-2-mini-strata", "messages": [{"role": "user", "content": prompt}]}
+req = urllib.request.Request(url + "/v1/chat/completions", json.dumps(body).encode(),
+                             {"Content-Type": "application/json"})
+try:
+    msg = json.load(urllib.request.urlopen(req, timeout=900))["choices"][0]["message"]
+except urllib.error.HTTPError as e:
+    sys.exit(e.read().decode())
+print(msg.get("content") or "")
+PY
+}
+
+case "${1:-status}" in
+  start) start ;;
+  stop) stop ;;
+  restart) stop; start ;;
+  status) status ;;
+  ask) shift; ask "$@" ;;
+  unload) curl -s -m 120 -X POST "$URL/unload"; echo ;;
+  logs) tail -f "$LOG" ;;
+  test) cd "$HERE" && "${UV[@]}" "${DEPS[@]}" "${TEST_DEPS[@]}" python -m pytest -q -p no:cacheprovider tests ;;
+  setup) uv run --no-project --python 3.12 "${DEPS[@]}" "${TEST_DEPS[@]}" python -c 'print("packages cached")' ;;
+  *) sed -n '2,12p' "$0"; exit 1 ;;
+esac

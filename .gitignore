@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# outputs of the tools (never commit model files, dumps or transcripts)
+results/
+*.strata
+*.gguf
+*.bin
+*.build_log.jsonl
+*.verify.json
+eval/data/
+eval/runs/
+eval/refs/
+shim/run/
+out/
